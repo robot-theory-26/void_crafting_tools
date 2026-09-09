@@ -33,20 +33,15 @@
   // ---------------------------------------------------------------------
   // MARKET SCAN
   // Pairs .mp-mat-card-name with .mp-mat-card-meta by index (they render
-  // as a flat list of sibling pairs per card in the market grid).
+  // as a flat list of sibling pairs per card in the market grid). Mutates
+  // the passed-in `prices` object with whatever is currently rendered on
+  // screen; does not load/save on its own (caller handles that).
   // ---------------------------------------------------------------------
-  function scanMarket() {
+  function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
+
+  function scanCurrentMarketPage(prices) {
     const names = Array.from(document.querySelectorAll('.mp-mat-card-name'));
     const metas = Array.from(document.querySelectorAll('.mp-mat-card-meta'));
-
-    if (names.length === 0) {
-      return { found: 0, warning: 'No .mp-mat-card-name elements found on this page. Are you on the Market screen?' };
-    }
-    if (names.length !== metas.length) {
-      console.warn('[VoidIdle Cost Calc] name/meta count mismatch', names.length, metas.length);
-    }
-
-    const prices = loadPrices();
     let count = 0;
 
     names.forEach((nameEl, i) => {
@@ -67,8 +62,49 @@
       }
     });
 
+    return count;
+  }
+
+  // Clicks through every top-level rail category, then every sublist
+  // item within it (if any), scanning the rendered cards each time.
+  async function scanAllMarkets(progressCb) {
+    const prices = loadPrices();
+    let totalFound = 0;
+
+    const railBtns = Array.from(document.querySelectorAll('.mp-rail-btn'))
+      .filter(b => !b.classList.contains('mp-rail-search-btn'));
+
+    if (railBtns.length === 0) {
+      return { found: 0, warning: 'No .mp-rail-btn elements found. Are you on the Market/Browse screen?' };
+    }
+
+    for (const railBtn of railBtns) {
+      const railTitle = railBtn.getAttribute('title') || 'Unknown category';
+      railBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await sleep(220);
+
+      const sublistBtns = Array.from(document.querySelectorAll('.mp-sublist-btn'));
+
+      if (sublistBtns.length > 0) {
+        for (const subBtn of sublistBtns) {
+          const labelEl = subBtn.querySelector('.mp-sublist-label');
+          const subName = labelEl ? labelEl.textContent.trim() : '';
+          subBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          await sleep(220);
+
+          const found = scanCurrentMarketPage(prices);
+          totalFound += found;
+          if (progressCb) progressCb(`${railTitle} / ${subName}`, totalFound);
+        }
+      } else {
+        const found = scanCurrentMarketPage(prices);
+        totalFound += found;
+        if (progressCb) progressCb(railTitle, totalFound);
+      }
+    }
+
     savePrices(prices);
-    return { found: count, warning: null };
+    return { found: totalFound, warning: null };
   }
 
   // ---------------------------------------------------------------------
@@ -76,8 +112,6 @@
   // Clicks each .cv-recipe-card, waits for the detail panel to update,
   // then reads .cv-detail-mats (fixed + tiered ingredients).
   // ---------------------------------------------------------------------
-  function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
-
   function readCurrentDetail(name) {
     const container = document.querySelector('.cv-detail-mats');
     const ingredients = [];
@@ -492,9 +526,12 @@ render();
       return b;
     }
 
-    makeBtn('📦 Scan Market', () => {
-      const res = scanMarket();
-      status.textContent = res.warning ? res.warning : `Scanned ${res.found} market items.`;
+    makeBtn('📦 Scan Market', async () => {
+      status.textContent = 'Scanning market... do not click anything.';
+      const res = await scanAllMarkets((where, total) => {
+        status.textContent = `Scanning ${where}... (${total} items so far)`;
+      });
+      status.textContent = res.warning ? res.warning : `Scanned ${res.found} market items across all categories.`;
     });
 
     makeBtn('🧪 Scan Recipes', async () => {
