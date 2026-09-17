@@ -32,22 +32,60 @@
 
   // ---------------------------------------------------------------------
   // MARKET SCAN
-  // Pairs .mp-mat-card-name with .mp-mat-card-meta by index (they render
-  // as a flat list of sibling pairs per card in the market grid). Mutates
-  // the passed-in `prices` object with whatever is currently rendered on
-  // screen; does not load/save on its own (caller handles that).
+  // The Marketplace screen uses four different UI layouts depending on
+  // category, so scanning dispatches to a different strategy per rail:
+  //   - Materials / Scrolls: fixed-price card grid
+  //   - Trade Gear: player-run single-price auction listings
+  //   - Runes: player-run per-unit rows
+  //   - Potions / Jade Packs / Spirit Shards: two-sided order book
+  // Weapons / Armor / Jewelry are skipped entirely (out of scope).
+  // Each scanner mutates the passed-in `prices` object; callers handle
+  // load/save.
   // ---------------------------------------------------------------------
   function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
 
-  function scanCurrentMarketPage(prices) {
-    const names = Array.from(document.querySelectorAll('.mp-mat-card-name'));
+  const SKILL_NAMES = ['Mining', 'Herbalism', 'Woodcutting', 'Alchemy', 'Enchanting', 'Engineering'];
+
+  // Clicks a left-nav-drawer item by its exact button text (e.g. "Market",
+  // one of SKILL_NAMES). Returns true if found and clicked.
+  function clickNavDrawerItem(label) {
+    const btns = Array.from(document.querySelectorAll('.nav-drawer-item'));
+    const target = btns.find(b => b.textContent.trim() === label);
+    if (!target) return false;
+    target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    return true;
+  }
+
+  // Clicks a sub-tab (.ws-tab) by exact text within the currently active
+  // skill screen (e.g. "Recipes"). Returns true if found and clicked.
+  function clickSkillSubTab(label) {
+    const tabs = Array.from(document.querySelectorAll('.ws-tab'));
+    const target = tabs.find(t => t.textContent.trim() === label);
+    if (!target) return false;
+    target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+    return true;
+  }
+
+  const SKIP_RAILS = ['Weapons', 'Armor', 'Jewelry'];
+  const LISTING_RAILS = ['Trade Gear'];
+  const RUNE_RAILS = ['Runes'];
+  const ORDER_BOOK_RAILS = ['Potions', 'Jade Packs', 'Spirit Shards'];
+
+  // Fixed-price card grid (Materials, Scrolls). Materials and Scrolls
+  // share the same `.mp-mat-card-meta` class but use different name
+  // classes, so the name element is found generically within the card.
+  function scanCardStyle(prices) {
     const metas = Array.from(document.querySelectorAll('.mp-mat-card-meta'));
     let count = 0;
 
-    names.forEach((nameEl, i) => {
-      const name = nameEl.textContent.trim();
-      const meta = metas[i];
-      if (!name || !meta) return;
+    metas.forEach(meta => {
+      // meta's own class (mp-mat-card-meta) contains "card", so .closest()
+      // would match meta itself rather than climbing to the card container —
+      // name/meta/counts are siblings under one parent, so go there directly.
+      const card = meta.parentElement;
+      const nameEl = card ? card.querySelector('[class*="name"]') : null;
+      const name = nameEl ? nameEl.textContent.trim() : null;
+      if (!name) return;
 
       let sell = null, buy = null;
       meta.querySelectorAll('span').forEach(span => {
@@ -65,11 +103,111 @@
     return count;
   }
 
+  // Player-run single-price auction listings (Trade Gear). Groups
+  // listings by item name and takes the cheapest as `buy`. Tier badge
+  // (e.g. "T2") is captured as a separate field alongside the price,
+  // not folded into the name.
+  function scanListingStyle(prices) {
+    const rows = Array.from(document.querySelectorAll('.mp-listing'));
+    const cheapest = {}; // name -> { price, tier }
+
+    rows.forEach(row => {
+      const nameEl = row.querySelector('.mp-item-name');
+      if (!nameEl) return;
+      const tierEl = nameEl.querySelector('.mp-tier-badge');
+      const tier = tierEl ? tierEl.textContent.trim() : null;
+      const name = nameEl.textContent.replace(tier || '', '').trim();
+      if (!name) return;
+
+      const priceEl = row.querySelector('[class*="price"]');
+      const price = priceEl ? parseGold(priceEl.textContent) : null;
+      if (price === null) return;
+
+      if (!cheapest[name] || price < cheapest[name].price) {
+        cheapest[name] = { price, tier };
+      }
+    });
+
+    let count = 0;
+    Object.entries(cheapest).forEach(([name, { price, tier }]) => {
+      prices[name] = { buy: price, sell: null, tier };
+      count++;
+    });
+    return count;
+  }
+
+  // Player-run per-unit rows (Runes). Groups rows by name and takes the
+  // cheapest per-unit ("/ea") price as `buy`.
+  function scanRuneRowStyle(prices) {
+    const rows = Array.from(document.querySelectorAll('.mp-rune-row'));
+    const cheapest = {}; // name -> price
+
+    rows.forEach(row => {
+      const nameEl = row.querySelector('.mp-rune-row-name');
+      const subEl = row.querySelector('.mp-rune-row-sub');
+      if (!nameEl || !subEl) return;
+      const name = nameEl.textContent.trim();
+      if (!name) return;
+
+      const match = subEl.textContent.match(/([\d,.]+)\s*\/\s*ea/i);
+      if (!match) return;
+      const price = parseGold(match[1]);
+      if (price === null) return;
+
+      if (cheapest[name] === undefined || price < cheapest[name]) {
+        cheapest[name] = price;
+      }
+    });
+
+    let count = 0;
+    Object.entries(cheapest).forEach(([name, price]) => {
+      prices[name] = { buy: price, sell: null };
+      count++;
+    });
+    return count;
+  }
+
+  // Two-sided order book (Potions, Jade Packs, Spirit Shards). One item
+  // per page/sublist: cheapest sell-side listing is the effective buy
+  // price for the shopper, highest buy-side listing is the effective
+  // sell price.
+  function scanOrderBookStyle(prices, itemName) {
+    if (!itemName) return 0;
+
+    const sellPrices = Array.from(document.querySelectorAll('.mp-ob-sell .mp-ob-row .mp-ob-price'))
+      .map(el => parseGold(el.textContent))
+      .filter(p => p !== null);
+    const buyPrices = Array.from(document.querySelectorAll('.mp-ob-buy .mp-ob-row .mp-ob-price'))
+      .map(el => parseGold(el.textContent))
+      .filter(p => p !== null);
+
+    const buy = sellPrices.length ? Math.min(...sellPrices) : null;
+    const sell = buyPrices.length ? Math.max(...buyPrices) : null;
+
+    if (buy === null && sell === null) return 0;
+    prices[itemName] = { buy, sell };
+    return 1;
+  }
+
+  function orderBookItemName(railTitle, subName) {
+    if (subName) return subName;
+    const titleEl = document.querySelector('.mp-main-title');
+    if (!titleEl) return null;
+    // Strip a leading emoji/icon prefix, e.g. "🧪 Health Potion" -> "Health Potion"
+    return titleEl.textContent.replace(/^[^\w]+/, '').trim();
+  }
+
   // Clicks through every top-level rail category, then every sublist
-  // item within it (if any), scanning the rendered cards each time.
+  // item within it (if any), scanning the rendered market with the
+  // strategy appropriate to that category.
   async function scanAllMarkets(progressCb) {
     const prices = loadPrices();
     let totalFound = 0;
+
+    if (!document.querySelector('.mp-rail-btn')) {
+      clickNavDrawerItem('Market');
+      await sleep(300);
+    }
 
     const railBtns = Array.from(document.querySelectorAll('.mp-rail-btn'))
       .filter(b => !b.classList.contains('mp-rail-search-btn'));
@@ -80,8 +218,17 @@
 
     for (const railBtn of railBtns) {
       const railTitle = railBtn.getAttribute('title') || 'Unknown category';
+      if (SKIP_RAILS.includes(railTitle)) continue;
+
       railBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       await sleep(220);
+
+      const scanPage = (subName) => {
+        if (LISTING_RAILS.includes(railTitle)) return scanListingStyle(prices);
+        if (RUNE_RAILS.includes(railTitle)) return scanRuneRowStyle(prices);
+        if (ORDER_BOOK_RAILS.includes(railTitle)) return scanOrderBookStyle(prices, orderBookItemName(railTitle, subName));
+        return scanCardStyle(prices);
+      };
 
       const sublistBtns = Array.from(document.querySelectorAll('.mp-sublist-btn'));
 
@@ -92,12 +239,12 @@
           subBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
           await sleep(220);
 
-          const found = scanCurrentMarketPage(prices);
+          const found = scanPage(subName);
           totalFound += found;
           if (progressCb) progressCb(`${railTitle} / ${subName}`, totalFound);
         }
       } else {
-        const found = scanCurrentMarketPage(prices);
+        const found = scanPage(null);
         totalFound += found;
         if (progressCb) progressCb(railTitle, totalFound);
       }
@@ -160,13 +307,10 @@
     return { ingredients, warning };
   }
 
-  async function scanRecipes(progressCb) {
+  // Scans every .cv-recipe-card currently rendered (i.e. whatever skill's
+  // Recipes tab is active) into `recipes`. Returns { count, warning }.
+  async function scanCurrentRecipePage(recipes, skillName, progressCb) {
     const cards = Array.from(document.querySelectorAll('.cv-recipe-card'));
-    if (cards.length === 0) {
-      return { found: 0, warning: 'No .cv-recipe-card elements found. Are you on the Crafting screen?' };
-    }
-
-    const recipes = loadRecipes();
     let count = 0;
     let lastWarning = null;
 
@@ -175,6 +319,23 @@
       const nameEl = card.querySelector('.cv-recipe-card-name');
       const name = nameEl ? nameEl.textContent.trim() : null;
       if (!name) continue;
+
+      if (card.classList.contains('locked')) {
+        // Locked cards don't respond to clicks — the detail panel stays on
+        // whatever was last selected, so reading it here would silently
+        // attribute the wrong recipe's ingredients to this locked item.
+        const lockEl = card.querySelector('.cv-recipe-card-lock');
+        recipes[name] = {
+          locked: true,
+          level: lockEl ? parseGold(lockEl.textContent) : null,
+          xp: null,
+          time: null,
+          ingredients: [],
+        };
+        count++;
+        if (progressCb) progressCb(`${skillName} — ${name} (locked)`, i + 1, cards.length);
+        continue;
+      }
 
       card.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       await sleep(150); // let the detail panel re-render
@@ -187,13 +348,45 @@
       if (warning) lastWarning = `[${name}] ${warning}`;
 
       recipes[name] = {
+        locked: false,
         level: lvlEl ? parseGold(lvlEl.textContent) : null,
         xp: xpEl ? parseGold(xpEl.textContent) : null,
         time: timeEl ? parseGold(timeEl.textContent) : null,
         ingredients,
       };
       count++;
-      if (progressCb) progressCb(i + 1, cards.length, name);
+      if (progressCb) progressCb(`${skillName} — ${name}`, i + 1, cards.length);
+    }
+
+    return { count, warning: lastWarning };
+  }
+
+  // Clicks through every Skill (Mining, Herbalism, Woodcutting, Alchemy,
+  // Enchanting, Engineering) — each has its own independent Recipes tab —
+  // and scans all recipe cards found there into a single merged store.
+  async function scanRecipes(progressCb) {
+    const recipes = loadRecipes();
+    let count = 0;
+    let lastWarning = null;
+    let anySkillFound = false;
+
+    for (const skillName of SKILL_NAMES) {
+      if (!clickNavDrawerItem(skillName)) continue;
+      await sleep(250);
+      clickSkillSubTab('Recipes');
+      await sleep(250);
+
+      const cards = document.querySelectorAll('.cv-recipe-card');
+      if (cards.length === 0) continue;
+      anySkillFound = true;
+
+      const { count: found, warning } = await scanCurrentRecipePage(recipes, skillName, progressCb);
+      count += found;
+      if (warning) lastWarning = warning;
+    }
+
+    if (!anySkillFound) {
+      return { found: 0, warning: 'No .cv-recipe-card elements found on any Skill screen. Is the nav drawer visible?' };
     }
 
     saveRecipes(recipes);
@@ -322,6 +515,7 @@
   <div class="controls">
     <label><input type="radio" name="pricemode" value="buy" checked> Cost ingredients at Buy price</label>
     <label><input type="radio" name="pricemode" value="sell"> Cost ingredients at Sell price (opportunity cost)</label>
+    <label><input type="checkbox" id="hideLocked" checked> Hide not-yet-unlocked recipes</label>
   </div>
 
   <table id="report">
@@ -343,6 +537,7 @@
 <script>
 const DATA = ${json};
 let priceMode = 'buy';
+let hideLocked = true;
 let sortKey = 'profit';
 let sortDir = -1;
 const tierChoice = {}; // recipeName -> { slotIndex: optionValue }
@@ -409,9 +604,10 @@ function computeRow(recipeName, recipe) {
 }
 
 function render() {
-  const rows = Object.entries(DATA.recipes).map(([name, r]) => computeRow(name, r));
+  const entries = Object.entries(DATA.recipes).filter(([, r]) => !hideLocked || !r.locked);
+  const rows = entries.map(([name, r]) => computeRow(name, r));
   document.getElementById('subtitle').textContent =
-    \`\${Object.keys(DATA.recipes).length} recipes · \${Object.keys(DATA.prices).length} market prices known\`;
+    \`\${entries.length} of \${Object.keys(DATA.recipes).length} recipes · \${Object.keys(DATA.prices).length} market prices known\`;
 
   rows.sort((a, b) => {
     const av = a[sortKey], bv = b[sortKey];
@@ -463,6 +659,10 @@ function render() {
 
 document.querySelectorAll('input[name=pricemode]').forEach(r => {
   r.addEventListener('change', e => { priceMode = e.target.value; render(); });
+});
+document.getElementById('hideLocked').addEventListener('change', e => {
+  hideLocked = e.target.checked;
+  render();
 });
 document.querySelectorAll('th[data-key]').forEach(th => {
   th.addEventListener('click', () => {
@@ -536,8 +736,8 @@ render();
 
     makeBtn('🧪 Scan Recipes', async () => {
       status.textContent = 'Scanning... do not click anything.';
-      const res = await scanRecipes((i, total, name) => {
-        status.textContent = `Scanning ${i}/${total}: ${name}`;
+      const res = await scanRecipes((where, i, total) => {
+        status.textContent = `Scanning ${where} (${i}/${total})`;
       });
       status.textContent = res.warning ? `Done, but: ${res.warning}` : `Scanned ${res.found} recipes.`;
     });
