@@ -1,13 +1,16 @@
 // ==UserScript==
 // @name         Void Idle - Crafting Cost Calculator
 // @namespace    voididle-cost-calc
-// @version      1.0
+// @version      1.1
 // @description  Scans market prices + recipes on voididle.com and generates a crafting cost/profit report in a new tab.
 // @match        https://www.voididle.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_openInTab
 // @run-at       document-idle
+// @homepageURL  https://github.com/robot-theory-26/void_crafting_tools
+// @downloadURL  https://raw.githubusercontent.com/robot-theory-26/void_crafting_tools/main/craft_cost_script.user.js
+// @updateURL    https://raw.githubusercontent.com/robot-theory-26/void_crafting_tools/main/craft_cost_script.user.js
 // ==/UserScript==
 
 (function () {
