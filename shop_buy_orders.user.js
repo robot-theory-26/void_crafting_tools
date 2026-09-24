@@ -6,6 +6,9 @@
 // @match        https://www.voididle.com/*
 // @grant        none
 // @run-at       document-idle
+// @homepageURL  https://github.com/robot-theory-26/void_crafting_tools
+// @downloadURL  https://raw.githubusercontent.com/robot-theory-26/void_crafting_tools/main/shop_buy_orders.user.js
+// @updateURL    https://raw.githubusercontent.com/robot-theory-26/void_crafting_tools/main/shop_buy_orders.user.js
 // ==/UserScript==
 
 (function () {
