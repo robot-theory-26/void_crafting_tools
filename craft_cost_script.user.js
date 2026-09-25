@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Void Idle - Crafting Cost Calculator
 // @namespace    voididle-cost-calc
-// @version      1.1
-// @description  Scans market prices + recipes on voididle.com and generates a crafting cost/profit report in a new tab.
+// @version      2.0
+// @description  Scans market prices + recipes on voididle.com and publishes a crafting cost/profit and material buy/sell report to a Google Sheet via SteinHQ.
 // @match        https://www.voididle.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @grant        GM_openInTab
+// @grant        GM_xmlhttpRequest
+// @connect      api.steinhq.com
 // @run-at       document-idle
 // @homepageURL  https://github.com/robot-theory-26/void_crafting_tools
 // @downloadURL  https://raw.githubusercontent.com/robot-theory-26/void_crafting_tools/main/craft_cost_script.user.js
@@ -21,11 +22,102 @@
   // ---------------------------------------------------------------------
   const PRICES_KEY = 'vic_prices_v1';   // { "Item Name": { buy: number, sell: number } }
   const RECIPES_KEY = 'vic_recipes_v1'; // { "Item Name": { level, xp, time, ingredients: [...] } }
+  const STEIN_CONFIG_KEY = 'vic_stein_config_v1'; // { storageId, username, password }
 
   function loadPrices() { return GM_getValue(PRICES_KEY, {}); }
   function savePrices(p) { GM_setValue(PRICES_KEY, p); }
   function loadRecipes() { return GM_getValue(RECIPES_KEY, {}); }
   function saveRecipes(r) { GM_setValue(RECIPES_KEY, r); }
+
+  function loadSteinConfig() { return GM_getValue(STEIN_CONFIG_KEY, null); }
+  function saveSteinConfig(cfg) { GM_setValue(STEIN_CONFIG_KEY, cfg); }
+
+  // Prompts for Stein storage ID + Basic Auth credentials and saves them
+  // via GM_setValue. Never hardcode these into the script source — this
+  // script is auto-published to a public GitHub repo, and anyone reading
+  // it would otherwise be able to write to the connected sheet.
+  function promptForSteinConfig() {
+    const existing = loadSteinConfig();
+    const storageId = prompt(
+      'Stein storage ID (from your Stein API dashboard URL, e.g. the\n' +
+      'part after /storages/ in https://api.steinhq.com/v1/storages/<id>):',
+      existing ? existing.storageId : ''
+    );
+    if (!storageId) return null;
+    const username = prompt('Stein Basic Auth username:', existing ? existing.username : '');
+    if (!username) return null;
+    const password = prompt('Stein Basic Auth password:', existing ? existing.password : '');
+    if (!password) return null;
+
+    const cfg = { storageId: storageId.trim(), username: username.trim(), password: password.trim() };
+    saveSteinConfig(cfg);
+    return cfg;
+  }
+
+  function steinRequest(cfg, sheetName, method, body) {
+    return new Promise((resolve, reject) => {
+      const url = `https://api.steinhq.com/v1/storages/${cfg.storageId}/${encodeURIComponent(sheetName)}`;
+      GM_xmlhttpRequest({
+        method,
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Basic ' + btoa(`${cfg.username}:${cfg.password}`),
+        },
+        data: body !== undefined ? JSON.stringify(body) : undefined,
+        onload: res => {
+          if (res.status >= 200 && res.status < 300) {
+            try { resolve(JSON.parse(res.responseText || '{}')); }
+            catch (e) { resolve({}); }
+          } else {
+            reject(new Error(`Stein ${method} "${sheetName}" failed: ${res.status} ${res.responseText}`));
+          }
+        },
+        onerror: () => reject(new Error(`Stein ${method} "${sheetName}" network error`)),
+      });
+    });
+  }
+
+  // Full clear-then-write: DELETE with an empty condition removes every
+  // existing data row (verified live: {"condition": {}} clears the whole
+  // sheet and leaves the header row untouched), then POST writes the
+  // fresh dataset. No incremental diffing — matches the old report's
+  // "regenerate from scratch" semantics.
+  async function replaceSheet(cfg, sheetName, rows) {
+    await steinRequest(cfg, sheetName, 'DELETE', { condition: {} });
+    if (rows.length) await steinRequest(cfg, sheetName, 'POST', rows);
+  }
+
+  async function publishToSheet(status) {
+    let cfg = loadSteinConfig();
+    if (!cfg) {
+      status.textContent = 'No Sheet Settings saved yet — opening setup...';
+      cfg = promptForSteinConfig();
+      if (!cfg) {
+        status.textContent = 'Publish cancelled — Sheet Settings required.';
+        return;
+      }
+    }
+
+    const prices = loadPrices();
+    const recipes = loadRecipes();
+    const recipeRows = buildRecipeCostRows(recipes, prices);
+    const buyRows = buildBuyOrderRows(prices);
+    const sellRows = buildSellListingRows(prices);
+
+    try {
+      status.textContent = 'Publishing Recipe Costs...';
+      await replaceSheet(cfg, 'Recipe Costs', recipeRows);
+      status.textContent = 'Publishing Raw Material Buy Orders...';
+      await replaceSheet(cfg, 'Raw Material Buy Orders', buyRows);
+      status.textContent = 'Publishing Raw Material Sell Listings...';
+      await replaceSheet(cfg, 'Raw Material Sell Listings', sellRows);
+      status.textContent =
+        `Published ${recipeRows.length} recipes, ${buyRows.length} buy orders, ${sellRows.length} sell listings.`;
+    } catch (e) {
+      status.textContent = 'Publish failed: ' + e.message;
+    }
+  }
 
   function parseGold(text) {
     if (!text) return null;
@@ -45,9 +137,28 @@
   // Each scanner mutates the passed-in `prices` object; callers handle
   // load/save.
   // ---------------------------------------------------------------------
-  function sleep(ms) { return new Promise(res => setTimeout(res, ms)); }
+  function waitForRender(root = document.body, { timeout = 1500, quietMs = 60 } = {}) {
+    return new Promise(resolve => {
+      let settled = false;
+      let quietTimer = null;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        obs.disconnect();
+        clearTimeout(quietTimer);
+        clearTimeout(hardTimer);
+        resolve();
+      };
+      const obs = new MutationObserver(() => {
+        clearTimeout(quietTimer);
+        quietTimer = setTimeout(finish, quietMs);
+      });
+      obs.observe(root, { childList: true, subtree: true, characterData: true });
+      const hardTimer = setTimeout(finish, timeout);
+    });
+  }
 
-  const SKILL_NAMES = ['Mining', 'Herbalism', 'Woodcutting', 'Alchemy', 'Enchanting', 'Engineering'];
+  const SKILL_NAMES = ['Mining', 'Herbalism', 'Woodcutting', 'Alchemy', 'Enchanting', 'Engineering', 'Runeworking'];
 
   // Clicks a left-nav-drawer item by its exact button text (e.g. "Market",
   // one of SKILL_NAMES). Returns true if found and clicked.
@@ -77,8 +188,18 @@
   // Fixed-price card grid (Materials, Scrolls). Materials and Scrolls
   // share the same `.mp-mat-card-meta` class but use different name
   // classes, so the name element is found generically within the card.
-  function scanCardStyle(prices) {
+  // Fixed-price summary card grid (Materials, Scrolls), now followed by a
+  // per-item drill-in into that item's order book to capture buyer/seller
+  // identity — the summary card alone only has a representative price, no
+  // name (verified live: clicking a card opens `.mp-orderbook` with
+  // `.mp-ob-sell`/`.mp-ob-buy` columns of named listings). `backBtn` is the
+  // sublist button (or rail button, if the rail has no sublists) already
+  // in scope in the caller — re-clicking it is the only reliable way back
+  // to the card grid: the `.mp-mobile-back` button in the detail view is
+  // mobile-only and isn't visible/clickable in a normal desktop viewport.
+  async function scanCardStyle(prices, backBtn) {
     const metas = Array.from(document.querySelectorAll('.mp-mat-card-meta'));
+    const names = [];
     let count = 0;
 
     metas.forEach(meta => {
@@ -99,9 +220,52 @@
 
       if (sell !== null || buy !== null) {
         prices[name] = { sell, buy };
+        names.push(name);
         count++;
       }
     });
+
+    for (const name of names) {
+      const cardBtn = Array.from(document.querySelectorAll('.mp-mat-card')).find(
+        c => c.querySelector('[class*="name"]')?.textContent.trim() === name
+      );
+      if (!cardBtn) continue;
+
+      cardBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+      await waitForRender();
+
+      const orderbook = document.querySelector('.mp-orderbook');
+      if (orderbook) {
+        const parseRow = row => {
+          const priceEl = row.querySelector('.mp-ob-price');
+          const metaEl = row.querySelector('.mp-ob-meta');
+          const price = priceEl ? parseGold(priceEl.textContent) : null;
+          const metaMatch = metaEl ? metaEl.textContent.match(/([\d,.]+)\s*×\s*·\s*(.+)/) : null;
+          const qty = metaMatch ? parseGold(metaMatch[1]) : null;
+          const who = metaMatch ? metaMatch[2].trim() : null;
+          return { price, qty, name: who };
+        };
+
+        const sellEntries = Array.from(orderbook.querySelectorAll('.mp-ob-sell .mp-ob-row'))
+          .map(parseRow).filter(e => e.price !== null);
+        const buyEntries = Array.from(orderbook.querySelectorAll('.mp-ob-buy .mp-ob-row'))
+          .map(parseRow).filter(e => e.price !== null);
+
+        if (sellEntries.length) {
+          prices[name].lowestSell = sellEntries.reduce((a, b) => (b.price < a.price ? b : a));
+        }
+        if (buyEntries.length) {
+          prices[name].highestBuy = buyEntries.reduce((a, b) => (b.price > a.price ? b : a));
+        }
+      }
+      // else: drill-in view didn't open for this item — keep the summary-only
+      // sell/buy price already stored above and move on.
+
+      if (backBtn) {
+        backBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        await waitForRender();
+      }
+    }
 
     return count;
   }
@@ -112,7 +276,7 @@
   // not folded into the name.
   function scanListingStyle(prices) {
     const rows = Array.from(document.querySelectorAll('.mp-listing'));
-    const cheapest = {}; // name -> { price, tier }
+    const cheapest = {}; // name -> { price, tier, seller }
 
     rows.forEach(row => {
       const nameEl = row.querySelector('.mp-item-name');
@@ -126,14 +290,22 @@
       const price = priceEl ? parseGold(priceEl.textContent) : null;
       if (price === null) return;
 
+      const sellerEl = row.querySelector('.mp-seller');
+      const seller = sellerEl ? sellerEl.textContent.trim() : null;
+
       if (!cheapest[name] || price < cheapest[name].price) {
-        cheapest[name] = { price, tier };
+        cheapest[name] = { price, tier, seller };
       }
     });
 
     let count = 0;
-    Object.entries(cheapest).forEach(([name, { price, tier }]) => {
-      prices[name] = { buy: price, sell: null, tier };
+    Object.entries(cheapest).forEach(([name, { price, tier, seller }]) => {
+      prices[name] = {
+        buy: price,
+        sell: null,
+        tier,
+        lowestSell: { price, qty: 1, name: seller },
+      };
       count++;
     });
     return count;
@@ -143,7 +315,7 @@
   // cheapest per-unit ("/ea") price as `buy`.
   function scanRuneRowStyle(prices) {
     const rows = Array.from(document.querySelectorAll('.mp-rune-row'));
-    const cheapest = {}; // name -> price
+    const cheapest = {}; // name -> { price, qty, seller }
 
     rows.forEach(row => {
       const nameEl = row.querySelector('.mp-rune-row-name');
@@ -152,19 +324,22 @@
       const name = nameEl.textContent.trim();
       if (!name) return;
 
-      const match = subEl.textContent.match(/([\d,.]+)\s*\/\s*ea/i);
+      // Format: "<seller> · <qty> avail · <price>/ea"
+      const match = subEl.textContent.match(/(.+?)\s*·\s*([\d,.]+)\s*avail\s*·\s*([\d,.]+)\s*\/\s*ea/i);
       if (!match) return;
-      const price = parseGold(match[1]);
+      const seller = match[1].trim();
+      const qty = parseGold(match[2]);
+      const price = parseGold(match[3]);
       if (price === null) return;
 
-      if (cheapest[name] === undefined || price < cheapest[name]) {
-        cheapest[name] = price;
+      if (cheapest[name] === undefined || price < cheapest[name].price) {
+        cheapest[name] = { price, qty, seller };
       }
     });
 
     let count = 0;
-    Object.entries(cheapest).forEach(([name, price]) => {
-      prices[name] = { buy: price, sell: null };
+    Object.entries(cheapest).forEach(([name, { price, qty, seller }]) => {
+      prices[name] = { buy: price, sell: null, lowestSell: { price, qty, name: seller } };
       count++;
     });
     return count;
@@ -209,7 +384,7 @@
 
     if (!document.querySelector('.mp-rail-btn')) {
       clickNavDrawerItem('Market');
-      await sleep(300);
+      await waitForRender();
     }
 
     const railBtns = Array.from(document.querySelectorAll('.mp-rail-btn'))
@@ -224,13 +399,13 @@
       if (SKIP_RAILS.includes(railTitle)) continue;
 
       railBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-      await sleep(220);
+      await waitForRender();
 
-      const scanPage = (subName) => {
+      const scanPage = (subName, backBtn) => {
         if (LISTING_RAILS.includes(railTitle)) return scanListingStyle(prices);
         if (RUNE_RAILS.includes(railTitle)) return scanRuneRowStyle(prices);
         if (ORDER_BOOK_RAILS.includes(railTitle)) return scanOrderBookStyle(prices, orderBookItemName(railTitle, subName));
-        return scanCardStyle(prices);
+        return scanCardStyle(prices, backBtn);
       };
 
       const sublistBtns = Array.from(document.querySelectorAll('.mp-sublist-btn'));
@@ -240,14 +415,14 @@
           const labelEl = subBtn.querySelector('.mp-sublist-label');
           const subName = labelEl ? labelEl.textContent.trim() : '';
           subBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-          await sleep(220);
+          await waitForRender();
 
-          const found = scanPage(subName);
+          const found = await scanPage(subName, subBtn);
           totalFound += found;
           if (progressCb) progressCb(`${railTitle} / ${subName}`, totalFound);
         }
       } else {
-        const found = scanPage(null);
+        const found = await scanPage(null, railBtn);
         totalFound += found;
         if (progressCb) progressCb(railTitle, totalFound);
       }
@@ -341,7 +516,7 @@
       }
 
       card.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-      await sleep(150); // let the detail panel re-render
+      await waitForRender();
 
       const lvlEl = card.querySelector('.cv-recipe-card-lvl');
       const xpEl = card.querySelector('.cv-recipe-card-xp');
@@ -375,9 +550,9 @@
 
     for (const skillName of SKILL_NAMES) {
       if (!clickNavDrawerItem(skillName)) continue;
-      await sleep(250);
+      await waitForRender();
       clickSkillSubTab('Recipes');
-      await sleep(250);
+      await waitForRender();
 
       const cards = document.querySelectorAll('.cv-recipe-card');
       if (cards.length === 0) continue;
@@ -397,295 +572,98 @@
   }
 
   // ---------------------------------------------------------------------
-  // REPORT (opens in a new tab as a self-contained HTML page)
+  // ROW BUILDERS (turn stored prices/recipes into the exact row shapes
+  // each Google Sheet tab needs)
   // ---------------------------------------------------------------------
-  function buildReportHtml(prices, recipes) {
-    const data = { prices, recipes };
-    const json = JSON.stringify(data).replace(/</g, '\\u003c');
 
-    return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Void Idle — Crafting Cost Report</title>
-<style>
-  :root {
-    --bg: #0D1219;
-    --panel: #161C27;
-    --panel2: #1E2530;
-    --border: #2A3240;
-    --text: #E8EAF0;
-    --muted: #8A93A6;
-    --accent: #A78BFA;
-    --accent2: #4FD1C5;
-    --profit: #4FD1C5;
-    --loss: #F27C7C;
-    --mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    padding: 32px 24px 80px;
-  }
-  h1 {
-    font-size: 22px;
-    font-weight: 650;
-    letter-spacing: -0.01em;
-    margin: 0 0 4px;
-  }
-  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
-  .controls {
-    display: flex;
-    gap: 16px;
-    align-items: center;
-    margin-bottom: 20px;
-    flex-wrap: wrap;
-  }
-  .controls label { font-size: 13px; color: var(--muted); display: flex; gap: 6px; align-items: center; }
-  select, input[type=text] {
-    background: var(--panel2);
-    border: 1px solid var(--border);
-    color: var(--text);
-    border-radius: 6px;
-    padding: 4px 8px;
-    font-size: 13px;
-    font-family: inherit;
-  }
-  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-  th {
-    text-align: left;
-    color: var(--muted);
-    font-weight: 550;
-    font-size: 12px;
-    text-transform: none;
-    padding: 8px 12px;
-    border-bottom: 1px solid var(--border);
-    cursor: pointer;
-    user-select: none;
-    white-space: nowrap;
-  }
-  th:hover { color: var(--text); }
-  td {
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
-    vertical-align: top;
-  }
-  tr:hover td { background: var(--panel); }
-  .num { font-family: var(--mono); text-align: right; white-space: nowrap; }
-  .item-name { font-weight: 600; }
-  .ingredients { color: var(--muted); font-size: 12.5px; line-height: 1.6; }
-  .ingredients .missing { color: var(--loss); }
-  .profit-pos { color: var(--profit); font-weight: 600; }
-  .profit-neg { color: var(--loss); font-weight: 600; }
-  .tier-select {
-    background: var(--panel2);
-    border: 1px solid var(--border);
-    color: var(--accent2);
-    border-radius: 4px;
-    font-size: 12px;
-    padding: 1px 4px;
-    margin-left: 4px;
-  }
-  .qty-fix {
-    width: 44px;
-    background: var(--panel2);
-    border: 1px solid var(--loss);
-    color: var(--text);
-    border-radius: 4px;
-    font-size: 12px;
-    padding: 1px 4px;
-    margin-left: 4px;
-  }
-  .badge {
-    display: inline-block;
-    font-size: 11px;
-    padding: 1px 6px;
-    border-radius: 999px;
-    background: var(--panel2);
-    color: var(--muted);
-    margin-left: 6px;
-  }
-  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
-</style>
-</head>
-<body>
-  <h1>Crafting Cost Report</h1>
-  <div class="sub" id="subtitle"></div>
+  // Always prices ingredients (and the recipe's own market value) at
+  // `.buy` — the original report's default "Cost ingredients at Buy
+  // price" mode, preserved as the only mode since there's no interactive
+  // toggle here. A tiered slot defaults to its first non-disabled option;
+  // an ingredient with unknown quantity counts as missing (no UI to
+  // supply an override in a non-interactive publish).
+  function computeRecipeRow(recipeName, recipe, prices) {
+    let cost = 0;
+    const missing = [];
+    const ingredientParts = [];
 
-  <div class="controls">
-    <label><input type="radio" name="pricemode" value="buy" checked> Cost ingredients at Buy price</label>
-    <label><input type="radio" name="pricemode" value="sell"> Cost ingredients at Sell price (opportunity cost)</label>
-    <label><input type="checkbox" id="hideLocked" checked> Hide not-yet-unlocked recipes</label>
-  </div>
-
-  <table id="report">
-    <thead>
-      <tr>
-        <th data-key="name">Item</th>
-        <th>Ingredients</th>
-        <th data-key="cost" class="num">Cost</th>
-        <th data-key="sell" class="num">Sells For</th>
-        <th data-key="profit" class="num">Profit</th>
-        <th data-key="time" class="num">Craft Time</th>
-        <th data-key="pps" class="num">Profit / sec</th>
-      </tr>
-    </thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <div class="empty" id="emptyMsg" style="display:none">No recipe data yet. Go back to the game, use "Scan Recipes", then reopen this report.</div>
-
-<script>
-const DATA = ${json};
-let priceMode = 'buy';
-let hideLocked = true;
-let sortKey = 'profit';
-let sortDir = -1;
-const tierChoice = {}; // recipeName -> { slotIndex: optionValue }
-const qtyOverride = {}; // recipeName -> { slotIndex: number }
-
-function fmt(n) {
-  if (n === null || n === undefined || isNaN(n)) return '—';
-  return n.toLocaleString(undefined, { maximumFractionDigits: 2 });
-}
-
-function priceFor(name) {
-  const p = DATA.prices[name];
-  if (!p) return null;
-  return priceMode === 'buy' ? p.buy : p.sell;
-}
-
-function computeRow(recipeName, recipe) {
-  let cost = 0;
-  let missing = [];
-  const ingredientBits = [];
-
-  recipe.ingredients.forEach((ing, idx) => {
-    if (ing.tiered) {
-      const chosenVal = (tierChoice[recipeName] && tierChoice[recipeName][idx]) ||
-        (ing.options.find(o => !o.disabled) || ing.options[0] || {}).value;
-      const opt = ing.options.find(o => o.value === chosenVal) || ing.options[0];
-      const qty = (qtyOverride[recipeName] && qtyOverride[recipeName][idx] != null)
-        ? qtyOverride[recipeName][idx] : ing.qty;
-      const unitPrice = opt ? priceFor(opt.label) : null;
-      if (unitPrice == null || qty == null) missing.push(opt ? opt.label : ing.label);
-      else cost += unitPrice * qty;
-
-      const optsHtml = ing.options.map(o =>
-        \`<option value="\${o.value}" \${o.disabled ? 'disabled' : ''} \${o.value===chosenVal?'selected':''}>\${o.label}</option>\`
-      ).join('');
-      const qtyHtml = ing.qty == null
-        ? \`<input class="qty-fix" type="text" placeholder="qty?" data-recipe="\${recipeName}" data-idx="\${idx}" data-kind="qty">\`
-        : '';
-      ingredientBits.push(
-        \`<span>\${qty ?? '?'}× <select class="tier-select" data-recipe="\${recipeName}" data-idx="\${idx}" data-kind="tier">\${optsHtml}</select>\${qtyHtml}</span>\`
-      );
-    } else {
-      const unitPrice = priceFor(ing.name);
-      if (unitPrice == null || ing.qty == null) missing.push(ing.name);
-      else cost += unitPrice * ing.qty;
-      ingredientBits.push(\`<span>\${ing.qty ?? '?'}× \${ing.name}\${unitPrice==null?' <span class="missing">(no price)</span>':''}</span>\`);
-    }
-  });
-
-  const sell = priceFor(recipeName);
-  const hasMissing = missing.length > 0;
-  const profit = (!hasMissing && sell != null) ? sell - cost : null;
-  const pps = (profit != null && recipe.time) ? profit / recipe.time : null;
-
-  return {
-    name: recipeName,
-    ingredientsHtml: ingredientBits.join(', '),
-    cost: hasMissing ? null : cost,
-    sell,
-    profit,
-    time: recipe.time,
-    pps,
-  };
-}
-
-function render() {
-  const entries = Object.entries(DATA.recipes).filter(([, r]) => !hideLocked || !r.locked);
-  const rows = entries.map(([name, r]) => computeRow(name, r));
-  document.getElementById('subtitle').textContent =
-    \`\${entries.length} of \${Object.keys(DATA.recipes).length} recipes · \${Object.keys(DATA.prices).length} market prices known\`;
-
-  rows.sort((a, b) => {
-    const av = a[sortKey], bv = b[sortKey];
-    if (av == null && bv == null) return 0;
-    if (av == null) return 1;
-    if (bv == null) return -1;
-    if (typeof av === 'string') return sortDir * av.localeCompare(bv);
-    return sortDir * (av - bv);
-  });
-
-  const tbody = document.getElementById('rows');
-  const emptyMsg = document.getElementById('emptyMsg');
-  if (rows.length === 0) {
-    tbody.innerHTML = '';
-    emptyMsg.style.display = 'block';
-    return;
-  }
-  emptyMsg.style.display = 'none';
-
-  tbody.innerHTML = rows.map(r => \`
-    <tr>
-      <td class="item-name">\${r.name}</td>
-      <td class="ingredients">\${r.ingredientsHtml}</td>
-      <td class="num">\${fmt(r.cost)}</td>
-      <td class="num">\${fmt(r.sell)}</td>
-      <td class="num \${r.profit>0?'profit-pos':(r.profit<0?'profit-neg':'')}">\${fmt(r.profit)}</td>
-      <td class="num">\${fmt(r.time)}\${r.time?'s':''}</td>
-      <td class="num \${r.pps>0?'profit-pos':(r.pps<0?'profit-neg':'')}">\${fmt(r.pps)}</td>
-    </tr>
-  \`).join('');
-
-  tbody.querySelectorAll('[data-kind="tier"]').forEach(sel => {
-    sel.addEventListener('change', e => {
-      const { recipe, idx } = e.target.dataset;
-      tierChoice[recipe] = tierChoice[recipe] || {};
-      tierChoice[recipe][idx] = e.target.value;
-      render();
+    recipe.ingredients.forEach(ing => {
+      if (ing.tiered) {
+        // Only a non-disabled option is usable — if every option is
+        // disabled (player hasn't unlocked any substitute), this slot is
+        // missing regardless of whether the disabled option happens to
+        // have a known market price.
+        const opt = ing.options.find(o => !o.disabled);
+        const label = opt ? opt.label : (ing.options[0] ? ing.options[0].label : ing.label);
+        const qty = ing.qty;
+        const unitPrice = opt && prices[opt.label] ? prices[opt.label].buy : null;
+        if (!opt || unitPrice == null || qty == null) missing.push(label);
+        else cost += unitPrice * qty;
+        ingredientParts.push(`${qty ?? '?'}x ${label}`);
+      } else {
+        const unitPrice = prices[ing.name] ? prices[ing.name].buy : null;
+        if (unitPrice == null || ing.qty == null) missing.push(ing.name);
+        else cost += unitPrice * ing.qty;
+        ingredientParts.push(`${ing.qty ?? '?'}x ${ing.name}`);
+      }
     });
-  });
-  tbody.querySelectorAll('[data-kind="qty"]').forEach(inp => {
-    inp.addEventListener('change', e => {
-      const { recipe, idx } = e.target.dataset;
-      qtyOverride[recipe] = qtyOverride[recipe] || {};
-      qtyOverride[recipe][idx] = parseFloat(e.target.value) || 0;
-      render();
-    });
-  });
-}
 
-document.querySelectorAll('input[name=pricemode]').forEach(r => {
-  r.addEventListener('change', e => { priceMode = e.target.value; render(); });
-});
-document.getElementById('hideLocked').addEventListener('change', e => {
-  hideLocked = e.target.checked;
-  render();
-});
-document.querySelectorAll('th[data-key]').forEach(th => {
-  th.addEventListener('click', () => {
-    const key = th.dataset.key;
-    if (sortKey === key) sortDir *= -1; else { sortKey = key; sortDir = -1; }
-    render();
-  });
-});
+    const sell = prices[recipeName] ? prices[recipeName].buy : null;
+    const hasMissing = missing.length > 0;
+    const finalCost = hasMissing ? null : cost;
+    const profit = (!hasMissing && sell != null) ? sell - finalCost : null;
+    const pps = (profit != null && recipe.time) ? profit / recipe.time : null;
 
-render();
-</script>
-</body>
-</html>`;
+    return {
+      name: recipeName,
+      ingredientsText: ingredientParts.join(', '),
+      cost: finalCost,
+      sell,
+      profit,
+      time: recipe.time,
+      pps,
+    };
   }
 
-  function openReport() {
-    const html = buildReportHtml(loadPrices(), loadRecipes());
-    const blob = new Blob([html], { type: 'text/html' });
-    const url = URL.createObjectURL(blob);
-    GM_openInTab(url, { active: true });
+  function buildRecipeCostRows(recipes, prices) {
+    return Object.entries(recipes)
+      .filter(([, r]) => !r.locked)
+      .map(([name, r]) => computeRecipeRow(name, r, prices))
+      .map(row => ({
+        'Item': row.name,
+        'Ingredients': row.ingredientsText,
+        'Cost': row.cost ?? '',
+        'Sells For': row.sell ?? '',
+        'Profit (est.)': row.profit ?? '',
+        'Craft Time': row.time ?? '',
+        'Profit/sec': row.pps ?? '',
+        'Price Acquired': '',
+        'Profit': '',
+      }));
+  }
+
+  function buildBuyOrderRows(prices) {
+    return Object.entries(prices)
+      .filter(([, p]) => p.highestBuy && p.highestBuy.price != null)
+      .map(([name, p]) => ({
+        'Material': name,
+        'Highest Buy Order': p.highestBuy.price,
+        'Buyer': p.highestBuy.name || '',
+        'Qty Available': p.highestBuy.qty ?? '',
+      }))
+      .sort((a, b) => b['Highest Buy Order'] - a['Highest Buy Order']);
+  }
+
+  function buildSellListingRows(prices) {
+    return Object.entries(prices)
+      .filter(([, p]) => p.lowestSell && p.lowestSell.price != null)
+      .map(([name, p]) => ({
+        'Material': name,
+        'Lowest Sell Price': p.lowestSell.price,
+        'Seller': p.lowestSell.name || '',
+        'Qty Available': p.lowestSell.qty ?? '',
+      }))
+      .sort((a, b) => a['Lowest Sell Price'] - b['Lowest Sell Price']);
   }
 
   // ---------------------------------------------------------------------
@@ -745,7 +723,12 @@ render();
       status.textContent = res.warning ? `Done, but: ${res.warning}` : `Scanned ${res.found} recipes.`;
     });
 
-    makeBtn('📊 View Cost Report', () => openReport());
+    makeBtn('⚙️ Sheet Settings', () => {
+      const cfg = promptForSteinConfig();
+      status.textContent = cfg ? 'Sheet Settings saved.' : 'Sheet Settings unchanged.';
+    });
+
+    makeBtn('📤 Publish to Sheet', () => publishToSheet(status));
 
     document.body.appendChild(panel);
   }
